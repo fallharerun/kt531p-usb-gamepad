@@ -11,6 +11,7 @@
 #include <Arduino.h>
 #include <Joystick.h>
 #include <EEPROM.h>
+#include <tusb.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <string.h>
@@ -20,9 +21,9 @@
 // HID エンドポイントの bInterval[ms]。arduino-pico 側が weak シンボルで定義して
 // いるので、同名のグローバル変数を置けば上書きできる。
 //
-// これは単なる上限ではなく、loop() 全体の周期を決める値である。send_now() が
-// ホストの次のポーリングまでスピン待ちするため、ループ側に何 ms のタイマを組んでも
-// これより速くはならない。既定の 10 のままでは 100Hz 前後しか出ない。
+// ホストはこの間隔でレポートを 1 つずつ引き取るので、これが送出レートの上限に
+// なる。ループ側に何 ms のタイマを組んでもこれより速くはならない。既定の 10 の
+// ままでは 100Hz 前後しか出ない。
 int usb_hid_poll_interval = 4;   // 250Hz
 
 // use16bit() 時の軸の値域。ディスクリプタが LOGICAL_MIN(-32767) 宣言なので、
@@ -45,24 +46,51 @@ constexpr int FAULT_RAIL_MARGIN = 64;
 constexpr int GUARD_LO = FAULT_RAIL_MARGIN;
 constexpr int GUARD_HI = ADC_MAX - FAULT_RAIL_MARGIN;
 
-// 単発ノイズでの誤検出を避けるため、連続で外れた回数がこれに達したら確定する。
-constexpr uint8_t FAULT_TRIP = 5;   // 250Hz なので 20ms
+// 単発ノイズでの誤検出を避けるため、すぐには確定しない。異常サンプルで +1、正常
+// サンプルで -1 するカウンタがこれに達したら確定する。連続回数で数えないのは、
+// 接触不良で正常値がときどき挟まる壊れ方でも確定させるため。
+constexpr uint8_t FAULT_TRIP = 5;   // 250Hz なので最短 20ms
+
+// 確定後は、正常サンプルがこの回数だけ連続するまで復帰させない。1 サンプルで復帰
+// させると、接触不良のたびに出力が 0 と実値の間を行き来する。
+constexpr uint8_t FAULT_RECOVER = 25;   // 250Hz なので 100ms
 
 constexpr uint32_t SEND_INTERVAL_MS      = 4;    // 250Hz
+constexpr uint32_t SEND_STALL_MS         = 20;   // ホストが引き取らないと判断するまで
 constexpr uint32_t HOUSEKEEP_INTERVAL_MS = 20;
+
+// 送出つきの読み取りどうしの最小間隔。ホストのポーリングはホスト側の時計で刻まれる
+// ので、デバイス側の 4ms とは正確には一致しない。ここを 4ms ちょうどにすると、
+// ホストの時計がわずかに速い組み合わせで、読み取りがポーリングから少しずつ遅れて
+// いき、いずれ 1 回ぶんレポートを載せ損ねる。bInterval を守らないホストに対する
+// レートの歯止めでしかないので、1ms 短くしておく。
+constexpr uint32_t SEND_MIN_GAP_MS = SEND_INTERVAL_MS - 1;
 constexpr uint32_t PRINT_INTERVAL_MS     = 100;  // デバッグ表示 10Hz
 
-constexpr int LINE_MAX = 96;   // 出力 1 行あたりの上限
+constexpr int LINE_MAX = 96;   // 出力 1 行あたりの上限（終端の NUL を含む）
+
+// 1 行を送るのに要る送信 FIFO の空き。本文の最大長に、println() が足す CR LF を
+// 加えたもの。FIFO の容量を超えると空き待ちの条件が永久に成立せず、何も出力
+// されなくなる。
+constexpr int LINE_WIRE_MAX = (LINE_MAX - 1) + 2;
+static_assert(LINE_WIRE_MAX <= CFG_TUD_CDC_TX_BUFSIZE,
+              "LINE_WIRE_MAX must fit in the CDC TX FIFO");
 
 // ============================================================================
 // キャリブレーションパラメータ
 // ============================================================================
 
 constexpr uint32_t CAL_HOLD_MS         = 3000;  // B ボタン長押しの判定時間
-constexpr uint32_t CAL_SETTLE_MS       = 3000;  // ニュートラル採取までの待ち
+constexpr uint32_t CAL_SETTLE_MS       = 3000;  // ニュートラル採取までに要る静止時間
+constexpr uint32_t CAL_SETTLE_MAX_MS   = 20000; // 静止しないときに諦めるまで
 constexpr uint32_t CAL_IDLE_FINISH_MS  = 5000;  // min/max 更新停止から確定まで
 constexpr uint32_t CAL_RESULT_MS       = 2000;  // 結果 LED の表示時間
 constexpr int      CAL_NEUTRAL_SAMPLES = 64;
+
+// ニュートラル採取前の静止判定。生値の振れ幅がこれを超えたら、操作系に手が触れて
+// いるとみなして待ち直す。ステアリングのデッドゾーンより小さくしてあるので、
+// 通過した時点のニュートラルの誤差はデッドゾーンに収まる。
+constexpr int CAL_STILL_SPREAD = 16;
 
 // キャリブレーション結果の妥当性チェック。壊れたキャリブレーションを保存して
 // 操作不能になるのを防ぐ。
@@ -77,6 +105,15 @@ constexpr int      CAL_NEUTRAL_SAMPLES = 64;
 constexpr int CAL_MIN_RANGE = 2000;
 constexpr int CAL_MIN_SIDE  = 700;
 constexpr int CAL_MAX_RANGE = 3800;
+
+// 端点は、断線判定のしきい値からこれだけ内側になければ受け付けない。しきい値の
+// 際まで許すと、キャリブレーションは通るのに、使っている最中にストッパーを強く
+// 押し込んだだけで断線と判定されて軸が 0 に落ちる（押し込み量で端点は数十
+// カウント動く）。可動域がここに掛かる個体は、ポテンショメータの両端に直列抵抗を
+// 入れて可動域をレールから離す必要がある。
+constexpr int CAL_RAIL_CLEARANCE = 50;
+constexpr int CAL_END_MIN = GUARD_LO + CAL_RAIL_CLEARANCE;
+constexpr int CAL_END_MAX = GUARD_HI - CAL_RAIL_CLEARANCE;
 
 // デッドゾーンと反転方向は個体差ではなく機構と配線で決まるので、キャリブレーション
 // 対象にせず定数で持つ。軸ごとに値を変えているのは、手を離したときの戻り位置の
@@ -124,8 +161,10 @@ static AxisCal calSteer;
 static AxisCal calThrottle;
 
 struct AxisState {
-  uint8_t faultCount = 0;
-  bool    faulted    = false;
+  uint8_t badCount  = 0;       // 異常サンプルで +1、正常サンプルで -1
+  uint8_t goodCount = 0;       // 断線確定後に連続した正常サンプル数
+  bool    faulted   = false;
+  int16_t lastGood  = 0;       // 直前の正常サンプルに対する出力
 };
 
 static AxisState stState;
@@ -203,16 +242,31 @@ static bool saveStored(StoredCal rec) {
   return loadStored(back) && memcmp(&back, &rec, sizeof(StoredCal)) == 0;
 }
 
+// 妥当でない理由を返す。妥当なら nullptr。理由はキャリブレーションの棄却時に
+// そのまま表示する。PC なしでは赤 LED しか見えないので、シリアルを繋いだときに
+// どの条件で落ちたかが分からないと、振り切り不足と個体の問題を切り分けられない。
+static const char* rangeProblem(int lo, int neu, int hi) {
+  // 端点がレール際 = キャリブレーション中にワイパーが浮いたか、可動域がレールに
+  // 近すぎる個体。通すと可動域が断線判定のしきい値と重なる。
+  if (lo < CAL_END_MIN || hi > CAL_END_MAX) {
+    return "end point too close to the ADC rail";
+  }
+  const int range = hi - lo;
+  if (range > CAL_MAX_RANGE) {
+    return "travel too long";
+  }
+  if (range < CAL_MIN_RANGE ||
+      (neu - lo) < CAL_MIN_SIDE ||
+      (hi - neu) < CAL_MIN_SIDE) {
+    return "travel too short (move to both limits)";
+  }
+  return nullptr;
+}
+
 // 保存時と読み込み時の両方で使う。CRC が一致していても値が異常なレコード（版を
 // 上げ忘れた古いビルドが書いたもの等）を弾くため、読み込み側でも必ず検査する。
 static bool rangeValid(int lo, int neu, int hi) {
-  const int range = hi - lo;
-  return range >= CAL_MIN_RANGE && range <= CAL_MAX_RANGE &&
-         (neu - lo) >= CAL_MIN_SIDE &&
-         (hi - neu) >= CAL_MIN_SIDE &&
-         // 端点がレール際 = キャリブレーション中にワイパーが浮いた等の異常。
-         // 通すと可動域が断線判定のしきい値と重なる。
-         lo >= GUARD_LO && hi <= GUARD_HI;
+  return rangeProblem(lo, neu, hi) == nullptr;
 }
 
 static bool storedValid(const StoredCal& rec) {
@@ -248,16 +302,16 @@ static void applyDefaults() {
 // LED（XIAO RP2040 の RGB LED はアノードコモンで LOW 点灯）
 // ============================================================================
 
-// pinMode(OUTPUT) 直後の出力レジスタは LOW＝点灯側なので、先に消灯レベルを書いて
-// おかないと起動時に 3 色同時点灯して白く光る。LED はキャリブレーション時の唯一の
-// UI であり、結果表示の緑／赤と紛らわしい。
+// pinMode(OUTPUT) は出力レジスタを LOW＝点灯側に初期化する。先に消灯レベルを
+// 書いておいても消されるので、直後に書く。放置すると 3 色同時点灯して白く光る。
+// LED はキャリブレーション時の唯一の UI であり、結果表示の緑／赤と紛らわしい。
 static void ledInit() {
-  digitalWrite(PIN_LED_R, HIGH);
-  digitalWrite(PIN_LED_G, HIGH);
-  digitalWrite(PIN_LED_B, HIGH);
   pinMode(PIN_LED_R, OUTPUT);
+  digitalWrite(PIN_LED_R, HIGH);
   pinMode(PIN_LED_G, OUTPUT);
+  digitalWrite(PIN_LED_G, HIGH);
   pinMode(PIN_LED_B, OUTPUT);
+  digitalWrite(PIN_LED_B, HIGH);
 }
 
 static void ledSet(bool r, bool g, bool b) {
@@ -308,10 +362,10 @@ static void outClear() {
   outCount = 0;
 }
 
-// FIFO に 1 行ぶんの空きがある限り流す。LINE_MAX を下回った時点で止めるので、
+// FIFO に 1 行ぶんの空きがある限り流す。LINE_WIRE_MAX を下回った時点で止めるので、
 // SerialUSB::write がスピン待ちに入ることはない。
 static void outFlush() {
-  while (outCount > 0 && Serial && Serial.availableForWrite() >= LINE_MAX) {
+  while (outCount > 0 && Serial && Serial.availableForWrite() >= LINE_WIRE_MAX) {
     Serial.println(outQueue[outHead]);
     outHead = (outHead + 1) % OUT_QUEUE_LINES;
     outCount--;
@@ -353,6 +407,15 @@ struct CalTrack {
   int lo = 0;
   int hi = 0;
   int neutral = 0;
+
+  // 次のサンプルで lo と hi の両方が必ず更新される、空の状態にする
+  void clear() {
+    lo = ADC_MAX;
+    hi = 0;
+  }
+
+  // 空のときは負になる
+  int spread() const { return hi - lo; }
 };
 
 static CalTrack trkSteer;
@@ -393,28 +456,46 @@ static int16_t scaleAxis(int raw, const AxisCal& c) {
   return static_cast<int16_t>(c.invert ? -v : v);
 }
 
-// ワイパーが外れると ADC ピンはフローティングになる。その値をそのままスケールすると
-// 全開・全ロックをランダムに出し続けるので、異常を検出したらニュートラル(0)へ
-// 落とす。前回値保持にしないのは、全開中に発生した場合に固着させないため。
+// ポテンショメータの電源線か GND 線が外れる、またはワイパーがどちらかへ短絡すると、
+// ADC の値はレールへ張り付く。そのままスケールすると全開・全ロックを出し続ける
+// ので、異常が確定したらニュートラル(0)へ落とす。前回値保持にしないのは、全開中に
+// 発生した場合に固着させないため。
 //
-// 完全な断線検出ではない。レールへ張り付く故障は捉えられるが、ワイパーが浮いた
-// まま可動域内の値を示す場合は検出できない。
+// 確定を待つ間だけは、直前の正常出力を保持する。この間もレール値をスケールして
+// しまうと、確定までの 20ms は全開が出る。接触不良で確定と復帰を繰り返す壊れ方
+// では、そのたびに全開のパルスになる。
+//
+// 完全な断線検出ではない。ワイパーだけが外れて ADC ピンが浮いた場合、値がレール
+// まで行かなければ検出できない。ピンに平滑用のコンデンサを付けていると直前の電圧を
+// 保持するので、出力は固着する。ピンと GND の間に 470kΩ〜1MΩ のプルダウンを入れて
+// おけば、浮いたピンは下側のレールへ落ち、ここで検出できる。
 static int16_t updateAxis(int raw, const AxisCal& c, AxisState& s) {
   const bool bad = (raw <= GUARD_LO) || (raw >= GUARD_HI);
 
   if (bad) {
-    if (s.faultCount < FAULT_TRIP) {
-      s.faultCount++;
+    s.goodCount = 0;
+    if (s.badCount < FAULT_TRIP) {
+      s.badCount++;
     }
-    if (s.faultCount >= FAULT_TRIP) {
+    if (s.badCount >= FAULT_TRIP) {
       s.faulted = true;
     }
-  } else {
-    s.faultCount = 0;
-    s.faulted = false;
+    return s.faulted ? 0 : s.lastGood;
   }
 
-  return s.faulted ? 0 : scaleAxis(raw, c);
+  if (s.faulted) {
+    if (++s.goodCount < FAULT_RECOVER) {
+      return 0;
+    }
+    s.faulted   = false;
+    s.badCount  = 0;
+    s.goodCount = 0;
+  } else if (s.badCount > 0) {
+    s.badCount--;
+  }
+
+  s.lastGood = scaleAxis(raw, c);
+  return s.lastGood;
 }
 
 // ============================================================================
@@ -426,7 +507,10 @@ static int16_t updateAxis(int raw, const AxisCal& c, AxisState& s) {
 // (now - calLastUpdate) が符号なし減算でアンダーフローする。
 static void enterCalibration(uint32_t now) {
   mode = Mode::CalSettle;
-  modeStart = now;
+  modeStart     = now;
+  calLastUpdate = now;
+  trkSteer.clear();
+  trkThrottle.clear();
   outLine("");
   outLine("== CALIBRATION ==");
   outLine("step 1/2: release both controls and wait (blue slow blink)");
@@ -470,38 +554,8 @@ static bool trackRange(CalTrack& t, int raw) {
   return updated;
 }
 
-static void finishCalibration(uint32_t now) {
-  const bool ok = rangeValid(trkSteer.lo, trkSteer.neutral, trkSteer.hi) &&
-                  rangeValid(trkThrottle.lo, trkThrottle.neutral, trkThrottle.hi);
-
-  outLinef("STEER     min %4d   neutral %4d   max %4d",
-           trkSteer.lo, trkSteer.neutral, trkSteer.hi);
-  outLinef("THROTTLE  min %4d   neutral %4d   max %4d",
-           trkThrottle.lo, trkThrottle.neutral, trkThrottle.hi);
-
-  if (ok) {
-    StoredCal rec{};
-    rec.steerLo  = static_cast<int16_t>(trkSteer.lo);
-    rec.steerNeu = static_cast<int16_t>(trkSteer.neutral);
-    rec.steerHi  = static_cast<int16_t>(trkSteer.hi);
-    rec.thrLo    = static_cast<int16_t>(trkThrottle.lo);
-    rec.thrNeu   = static_cast<int16_t>(trkThrottle.neutral);
-    rec.thrHi    = static_cast<int16_t>(trkThrottle.hi);
-
-    calSaved = saveStored(rec);
-    if (calSaved) {
-      applyStored(rec);
-      usingDefaults = false;
-      outLine("saved to EEPROM");
-    } else {
-      outLine("EEPROM write FAILED - previous calibration kept");
-    }
-  } else {
-    // キャリブレーションモードに入ったまま動かさなかった場合もここへ来る。前の
-    // キャリブレーションを維持したまま戻るので、誤って入っても実害は出ない。
-    calSaved = false;
-    outLine("REJECTED (implausible travel) - previous calibration kept");
-  }
+static void showResult(uint32_t now, bool saved) {
+  calSaved = saved;
 
   stState = AxisState{};
   thState = AxisState{};
@@ -510,14 +564,64 @@ static void finishCalibration(uint32_t now) {
   modeStart = now;
 }
 
+static void finishCalibration(uint32_t now) {
+  const char* whySt = rangeProblem(trkSteer.lo, trkSteer.neutral, trkSteer.hi);
+  const char* whyTh =
+      rangeProblem(trkThrottle.lo, trkThrottle.neutral, trkThrottle.hi);
+
+  outLinef("STEER     min %4d   neutral %4d   max %4d",
+           trkSteer.lo, trkSteer.neutral, trkSteer.hi);
+  outLinef("THROTTLE  min %4d   neutral %4d   max %4d",
+           trkThrottle.lo, trkThrottle.neutral, trkThrottle.hi);
+
+  if (whySt || whyTh) {
+    // キャリブレーションモードに入ったまま動かさなかった場合もここへ来る。前の
+    // キャリブレーションを維持したまま戻るので、誤って入っても実害は出ない。
+    if (whySt) {
+      outLinef("  STEER:    %s", whySt);
+    }
+    if (whyTh) {
+      outLinef("  THROTTLE: %s", whyTh);
+    }
+    outLine("REJECTED (implausible travel) - previous calibration kept");
+    showResult(now, false);
+    return;
+  }
+
+  StoredCal rec{};
+  rec.steerLo  = static_cast<int16_t>(trkSteer.lo);
+  rec.steerNeu = static_cast<int16_t>(trkSteer.neutral);
+  rec.steerHi  = static_cast<int16_t>(trkSteer.hi);
+  rec.thrLo    = static_cast<int16_t>(trkThrottle.lo);
+  rec.thrNeu   = static_cast<int16_t>(trkThrottle.neutral);
+  rec.thrHi    = static_cast<int16_t>(trkThrottle.hi);
+
+  const bool saved = saveStored(rec);
+  if (saved) {
+    applyStored(rec);
+    usingDefaults = false;
+    outLine("saved to EEPROM");
+  } else {
+    // セクタの消去までは済んでいるかもしれないので、フラッシュ上の前の値が残って
+    // いるとは限らない。動作中の値は変えないが、再起動後は既定値に戻りうる。
+    outLine("EEPROM write FAILED - stored calibration may be lost, recalibrate");
+  }
+  showResult(now, saved);
+}
+
 // キャリブレーション中は両軸の出力を 0 に固定するため、中断手段が無いと誤って
 // 入ったときに最短 10 秒間どちらも効かなくなる。B の短押しとシリアル 'q' で
 // いつでも戻す。前のキャリブレーションはそのまま維持される。
+//
+// 結果表示まで進んでいれば保存の成否は確定済みなので、表示を打ち切るだけになる。
 static void abortCalibration() {
+  const bool decided = (mode == Mode::CalResult);
+
   mode = Mode::Run;
   stState = AxisState{};
   thState = AxisState{};
-  outLine("== calibration ABORTED - previous calibration kept ==");
+  outLine(decided ? "== back to normal operation =="
+                  : "== calibration ABORTED - previous calibration kept ==");
 }
 
 static void updateLed(uint32_t now) {
@@ -574,21 +678,34 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
-  static uint32_t nextSend = 0;
+  static uint32_t lastSample  = 0;
+  static bool     hostPolling = false;   // 直前の読み取りを送出できたか
   static int16_t  outSt = 0;
   static int16_t  outTh = 0;
   static int      rawSt = 0;
   static int      rawTh = 0;
 
-  // --- HID 送出（250Hz）---
-  if (static_cast<int32_t>(now - nextSend) >= 0) {
-    // 周期は now 代入ではなく加算で刻む。now を入れると 1 周期あたりの処理時間
-    // ぶん必ず遅れ、実効レートが公称値に届かない。
-    nextSend += SEND_INTERVAL_MS;
-    if (static_cast<int32_t>(now - nextSend) >= static_cast<int32_t>(SEND_INTERVAL_MS)) {
-      // 大きく遅れたときは連続送出で取り戻そうとせず、now から刻み直す
-      nextSend = now + SEND_INTERVAL_MS;
-    }
+  // --- 読み取りと HID 送出（250Hz）---
+  //
+  // send_now() は、前回のレポートがホストに引き取られていないと最大 500ms スピン
+  // 待ちする（マウント前とサスペンド中は待たずに戻る）。ホストが HID をポーリング
+  // しない状態でこれを踏むと loop() が 2Hz になり、ボタンも LED もキャリブレーション
+  // の追従も止まるので、エンドポイントが空いているときにしか呼ばない。
+  //
+  // 読み取りはエンドポイントが空くのを待ってから行う。空くのはホストが前回の
+  // レポートを引き取った直後なので、そこで読んだ値が次のポーリングで出ていく。
+  // 先に読んでから空きを待つと、待った時間（最大 1 周期）だけ古い値を送ることに
+  // なる。
+  //
+  // ホストが引き取らない間も、断線判定とキャリブレーションの追従は止められない。
+  // SEND_STALL_MS 待っても空かなければ、以後は送出なしで読み取りだけを進める。
+  const uint32_t sinceSample = now - lastSample;
+  const bool     hidReady    = tud_hid_ready();
+  const uint32_t giveUp      = hostPolling ? SEND_STALL_MS : SEND_INTERVAL_MS;
+
+  if ((hidReady && sinceSample >= SEND_MIN_GAP_MS) || sinceSample >= giveUp) {
+    lastSample  = now;
+    hostPolling = hidReady;
 
     rawSt = readAveraged(PIN_STEER);
     rawTh = readAveraged(PIN_THROTTLE);
@@ -600,7 +717,18 @@ void loop() {
       // キャリブレーション中は端まで大きく動かすので、その動きをゲームへ送らない
       outSt = 0;
       outTh = 0;
-      if (mode == Mode::CalRange) {
+      if (mode == Mode::CalSettle) {
+        // 操作系に手が触れている間はニュートラルを採らない。振れ幅が収まるまで
+        // 待ち直す
+        trackRange(trkSteer,    rawSt);
+        trackRange(trkThrottle, rawTh);
+        if (trkSteer.spread() > CAL_STILL_SPREAD ||
+            trkThrottle.spread() > CAL_STILL_SPREAD) {
+          trkSteer.clear();
+          trkThrottle.clear();
+          calLastUpdate = now;
+        }
+      } else if (mode == Mode::CalRange) {
         // ピークを取り逃さないよう、追従はサンプルレートで行う
         const bool a = trackRange(trkSteer,    rawSt);
         const bool b = trackRange(trkThrottle, rawTh);
@@ -610,10 +738,12 @@ void loop() {
       }
     }
 
-    Joystick.X(outSt);
-    Joystick.Y(outTh);
-    Joystick.send_now();   // ホストがポーリングするまでここでブロックする
-    sendCount++;
+    if (hidReady) {
+      Joystick.X(outSt);
+      Joystick.Y(outTh);
+      Joystick.send_now();
+      sendCount++;
+    }
   }
 
   // --- 低頻度の処理（20ms）---
@@ -629,8 +759,12 @@ void loop() {
   // --- キャリブレーションモードの遷移 ---
   switch (mode) {
     case Mode::CalSettle:
-      if (now - modeStart >= CAL_SETTLE_MS) {
+      if (now - calLastUpdate >= CAL_SETTLE_MS) {
         beginRangePhase(now);
+      } else if (now - modeStart >= CAL_SETTLE_MAX_MS) {
+        // いつまでも静止しないまま出力 0 で居座らないよう、諦めて戻る
+        outLine("REJECTED (controls did not settle) - previous calibration kept");
+        showResult(now, false);
       }
       break;
     case Mode::CalRange:
@@ -658,10 +792,20 @@ void loop() {
   // bTriggered は 1 押下につき 1 回しかトリガさせないためのラッチ。これが無いと、
   // 押しっぱなしのままキャリブレーションが終わった時点で長押し条件が再び成立し、
   // 指を離すまでキャリブレーションに入り直し続ける。
+  //
+  // 離したと判定するのは 2 回連続で離れて読めたときだけ。長押し中に 1 回読み
+  // 落としただけで押し直しと扱うと、長押しの計時がやり直しになり、キャリブレーション
+  // に入った直後ならその場で中断してしまう。
   static bool     bWasDown   = false;
   static bool     bTriggered = false;
   static uint32_t bDownAt    = 0;
-  const bool bDown = BOOTSEL;
+  static uint8_t  bUpStreak  = 2;
+  if (BOOTSEL) {
+    bUpStreak = 0;
+  } else if (bUpStreak < 2) {
+    bUpStreak++;
+  }
+  const bool bDown = bWasDown ? (bUpStreak < 2) : (bUpStreak == 0);
 
   if (bDown && !bWasDown) {
     bDownAt    = now;
@@ -709,9 +853,11 @@ void loop() {
   }
 
   // --- デバッグ表示 ---
+  // レートの集計は表示の有無に関わらず行う。表示を止めている間 sendCount を溜め
+  // 込むと、再開した最初の 1 行で積が桁あふれする。
   static uint32_t nextPrint = 0;
   static uint32_t rateStamp = 0;
-  if (debugPrint && static_cast<int32_t>(now - nextPrint) >= 0) {
+  if (static_cast<int32_t>(now - nextPrint) >= 0) {
     nextPrint = now + PRINT_INTERVAL_MS;
 
     const uint32_t elapsed = now - rateStamp;
@@ -719,7 +865,13 @@ void loop() {
     sendCount = 0;
     rateStamp = now;
 
-    if (mode == Mode::CalRange) {
+    if (!debugPrint) {
+      // 集計だけして何も出さない
+    } else if (mode == Mode::CalSettle) {
+      outLinef("CAL  settling  ST %4d  TH %4d   still %lus",
+               rawSt, rawTh,
+               static_cast<unsigned long>((now - calLastUpdate) / 1000));
+    } else if (mode == Mode::CalRange) {
       outLinef("CAL  ST [%4d..%4d]  TH [%4d..%4d]   idle %lus",
                trkSteer.lo, trkSteer.hi, trkThrottle.lo, trkThrottle.hi,
                static_cast<unsigned long>((now - calLastUpdate) / 1000));
